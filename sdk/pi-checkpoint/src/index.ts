@@ -1,5 +1,6 @@
 export { loadConfig, loadConfigFromFile, defaultConfig } from "./config";
 export { RepoManager } from "./repo-manager";
+export { isGitWorkTree } from "./git-work-tree";
 export type { SafeCheckoutResult } from "./repo-manager";
 export { getCheckpointSessionsRoot, getRepoDir, getGitDir, getIndexPath } from "./resolver";
 export { exec, execSafe, type ExecEnv, type Result } from "./exec";

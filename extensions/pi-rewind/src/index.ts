@@ -9,8 +9,14 @@ import {
   bindSessionRepo,
   getRepoDir,
   resolveSessionCheckpointStorage,
+  isGitWorkTree,
 } from "@ayulab/pi-checkpoint";
-import type { RepoProvider, CheckpointConfig, CheckpointEntry } from "@ayulab/pi-checkpoint";
+import type {
+  RepoManager,
+  RepoProvider,
+  CheckpointConfig,
+  CheckpointEntry,
+} from "@ayulab/pi-checkpoint";
 import { errorMessage, isRecord } from "@ayulab/runtime-core";
 import { extractPrompt, findLastUserEntry } from "./utils/prompt";
 import { registerCheckpointStorageCommand } from "./commands/checkpoint";
@@ -112,24 +118,38 @@ export default function (pi: ExtensionAPI, provider?: RepoProvider) {
   const repos = provider ?? createDefaultRepoProvider();
 
   const runtime = new RewindSessionRuntimeState();
+  const failedCheckpointSessions = new Set<string>();
 
   async function getOrCreateAutoCheckpointProducer(
     sessionId: string,
     ctx: ExtensionContext,
     config: CheckpointConfig,
   ): Promise<AutoCheckpointProducer | undefined> {
+    if (!config.enabled || !config.autoCheckpoint || failedCheckpointSessions.has(sessionId)) {
+      return undefined;
+    }
+    if (!(await isGitWorkTree(ctx.cwd))) {
+      runtime.producers.delete(sessionId);
+      return undefined;
+    }
     const existing = runtime.producers.getOrUndefined(sessionId);
     if (existing) return existing;
-    /* v8 ignore next */
-    if (!config.enabled || !config.autoCheckpoint) return undefined;
 
-    const repo = await bindSessionRepo(
-      sessionId,
-      ctx.sessionManager.getSessionFile(),
-      ctx.cwd,
-      repos,
-      { exclude: config.exclude },
-    );
+    let repo: RepoManager;
+    try {
+      repo = await bindSessionRepo(sessionId, ctx.sessionManager.getSessionFile(), ctx.cwd, repos, {
+        exclude: config.exclude,
+      });
+    } catch (error) {
+      failedCheckpointSessions.add(sessionId);
+      if (ctx.hasUI) {
+        ctx.ui.notify(
+          `File checkpoint could not be created: ${errorMessage(error)}. Automatic file checkpoints are paused for this session; the agent can continue. Resolve the storage problem, then run /reload to retry.`,
+          "warning",
+        );
+      }
+      return undefined;
+    }
     configureRepo(repo, config);
 
     const producer = createAutoCheckpointProducer(
@@ -150,6 +170,14 @@ export default function (pi: ExtensionAPI, provider?: RepoProvider) {
     cwd: string,
     config: CheckpointConfig,
   ): Promise<RestoreRepoResult> {
+    if (!(await isGitWorkTree(cwd))) {
+      return {
+        ok: false,
+        reason: "not-git-work-tree",
+        message:
+          "File checkpoints require an existing Git work tree. Conversation restore is still available.",
+      };
+    }
     const storage = await resolveSessionCheckpointStorage({ sessionFile, cwd });
     if (!storage.ok) return { ok: false, reason: "not-found" };
 
@@ -198,7 +226,7 @@ export default function (pi: ExtensionAPI, provider?: RepoProvider) {
 
   pi.on("session_shutdown", async (event, ctx) => {
     await finalizeCheckpointForSession(ctx, { force: true });
-    if (event.reason === "fork") {
+    if (event.reason === "fork" && (await isGitWorkTree(ctx.cwd))) {
       await writeForkIntent(event.targetSessionFile, pendingForkIntent);
     }
     pendingForkIntent = undefined;
@@ -207,6 +235,7 @@ export default function (pi: ExtensionAPI, provider?: RepoProvider) {
   pi.on("session_start", async (event, ctx) => {
     const sessionFile = ctx.sessionManager.getSessionFile();
     const sessionId = ctx.sessionManager.getSessionId();
+    failedCheckpointSessions.delete(sessionId);
 
     // Merge raw settings first so project files inherit missing values from global settings
     // before the checkpoint defaults are applied.
@@ -229,6 +258,7 @@ export default function (pi: ExtensionAPI, provider?: RepoProvider) {
     if (event.reason === "fork") {
       const entries = ctx.sessionManager.getEntries();
       runtime.resetSession(sessionId, entries, ctx.sessionManager.getBranch(), false);
+      if (!(await isGitWorkTree(ctx.cwd))) return;
       const forkIntent = await readForkIntent(sessionFile);
       if (!event.previousSessionFile) return;
 
@@ -310,6 +340,8 @@ export default function (pi: ExtensionAPI, provider?: RepoProvider) {
             ctx.hasUI ? ctx.ui : undefined,
             CHECKPOINT_STORAGE_MISSING_MESSAGE,
           );
+        } else if (restoreRepo.reason === "not-git-work-tree") {
+          showCodeRestoreWarning(ctx.hasUI ? ctx.ui : undefined, restoreRepo.message);
         } else {
           notifyUnusableResumeStorage(ctx.hasUI ? ctx.ui : undefined, restoreRepo.message);
         }
@@ -342,6 +374,10 @@ export default function (pi: ExtensionAPI, provider?: RepoProvider) {
     await runtime.sessionTasks.run(sessionId, async () => {
       const producer = runtime.producers.getOrUndefined(sessionId);
       if (!producer) return;
+      if (!(await isGitWorkTree(ctx.cwd))) {
+        runtime.producers.delete(sessionId);
+        return;
+      }
       if (!options?.force && !producer.shouldFinalizeOnAgentEnd()) return;
 
       const result = await producer.finalizeRun();
@@ -518,6 +554,8 @@ export default function (pi: ExtensionAPI, provider?: RepoProvider) {
     if (!restoreRepo.ok) {
       if (restoreRepo.reason === "not-found") {
         showCodeRestoreWarning(restoreUi, CHECKPOINT_STORAGE_MISSING_MESSAGE);
+      } else if (restoreRepo.reason === "not-git-work-tree") {
+        showCodeRestoreWarning(restoreUi, restoreRepo.message);
       } else {
         notifyUnusableResumeStorage(restoreUi, restoreRepo.message);
       }
@@ -559,6 +597,9 @@ export default function (pi: ExtensionAPI, provider?: RepoProvider) {
         config,
       );
       if (restoreRepo.ok) return { ok: true, repo: restoreRepo.repo };
+      if (restoreRepo.reason === "not-git-work-tree") {
+        return { ok: false, message: restoreRepo.message, level: "warning" };
+      }
       if (restoreRepo.reason === "not-found") {
         return {
           ok: false,

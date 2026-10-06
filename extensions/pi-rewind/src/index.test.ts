@@ -9,6 +9,7 @@ import type {
   SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { RepoManager } from "@ayulab/pi-checkpoint";
+import * as checkpointSdk from "@ayulab/pi-checkpoint";
 import type { CheckpointConfig, CheckpointEntry, SafeCheckoutResult } from "@ayulab/pi-checkpoint";
 import { createMockRepo } from "@ayulab/pi-checkpoint/testing";
 import {
@@ -480,6 +481,8 @@ describe("checkpoint extension", () => {
 
   beforeEach(async () => {
     tmpDir = await createTmpDir();
+    // Existing lifecycle unit tests inject repositories; eligibility is tested below.
+    vi.spyOn(checkpointSdk, "isGitWorkTree").mockResolvedValue(true);
     sessionFile = path.join(tmpDir, ".pi", "agent", "sessions", "session.jsonl");
     await fs.mkdir(path.dirname(sessionFile), { recursive: true });
     await fs.writeFile(sessionFile, "", "utf8");
@@ -503,6 +506,157 @@ describe("checkpoint extension", () => {
         throw err;
       }
     }
+  });
+
+  test("non-Git sessions skip automatic checkpoints even with a nested Git repository", async () => {
+    vi.mocked(checkpointSdk.isGitWorkTree).mockRestore();
+    const nested = path.join(tmpDir, "nested-project");
+    await fs.mkdir(path.join(nested, ".git"), { recursive: true });
+    await fs.writeFile(path.join(tmpDir, "unrelated.txt"), "outside a repository\n");
+    const { api, events, appendEntry, registerCommand } = createMockApi();
+    const ext = await import("./index");
+    ext.default(api);
+    const ctx = createMockContext(sessionFile, [createUserEntry("entry-1", "hello")], tmpDir);
+    for (const handler of events["session_start"] ?? []) await handler({ reason: "new" }, ctx);
+    await emitAssistantStart(events, ctx);
+    await emitAssistantEnd(events, ctx);
+    for (const handler of events["agent_end"] ?? []) await handler({}, ctx);
+    const repoDir = checkpointSdk.getRepoDir(sessionFile);
+    await expect(fs.access(repoDir)).rejects.toThrow();
+    expect(appendEntry).not.toHaveBeenCalled();
+    expect(ctx.ui.notify).not.toHaveBeenCalled();
+    expect(registerCommand.mock.calls.map(([name]) => name)).toContain("rewind");
+    expect(registerCommand.mock.calls.map(([name]) => name)).toContain("checkpoint");
+  });
+
+  test("real Git sessions still capture changes without modifying the user's index", async () => {
+    vi.mocked(checkpointSdk.isGitWorkTree).mockRestore();
+    await checkpointSdk.exec("git", ["init", tmpDir]);
+    const file = path.join(tmpDir, "file.txt");
+    await fs.writeFile(file, "before\n");
+    await checkpointSdk.exec("git", ["-C", tmpDir, "add", "file.txt"]);
+    const indexPath = path.join(tmpDir, ".git", "index");
+    const indexBefore = await fs.readFile(indexPath);
+    const headBefore = await fs.readFile(path.join(tmpDir, ".git", "HEAD"));
+    const { api, events, appendEntry } = createMockApi();
+    const ext = await import("./index");
+    ext.default(api);
+    const ctx = createMockContext(sessionFile, [createUserEntry("entry-1", "edit")], tmpDir);
+    for (const handler of events["session_start"] ?? []) await handler({ reason: "new" }, ctx);
+    await emitAssistantStart(events, ctx);
+    await fs.writeFile(file, "after\n");
+    await emitAssistantEnd(events, ctx);
+    for (const handler of events["agent_end"] ?? []) await handler({}, ctx);
+    expect(appendEntry).toHaveBeenCalledTimes(1);
+    expect(getCheckpointEntryCall(appendEntry, 0).fileCount).toBe(1);
+    expect(await fs.readFile(indexPath)).toEqual(indexBefore);
+    expect(await fs.readFile(path.join(tmpDir, ".git", "HEAD"))).toEqual(headBefore);
+  });
+
+  test("non-Git forks do not copy legacy storage or write fork checkpoint markers", async () => {
+    vi.mocked(checkpointSdk.isGitWorkTree).mockRestore();
+    const legacyFile = path.join(path.dirname(sessionFile), "legacy.jsonl");
+    const legacyRepo = new RepoManager(
+      checkpointSdk.getGitDir(checkpointSdk.getRepoDir(legacyFile)),
+      checkpointSdk.getIndexPath(checkpointSdk.getRepoDir(legacyFile)),
+      tmpDir,
+    );
+    await legacyRepo.init();
+    const { api, events } = createMockApi();
+    const ext = await import("./index");
+    ext.default(api);
+    const ctx = createMockContext(sessionFile, [], tmpDir);
+    for (const handler of events["session_start"] ?? []) {
+      await handler({ reason: "fork", previousSessionFile: legacyFile }, ctx);
+    }
+    for (const handler of events["session_before_fork"] ?? []) {
+      await handler({ entryId: "entry-1", position: "before" }, ctx);
+    }
+    const targetFile = path.join(path.dirname(sessionFile), "target.jsonl");
+    for (const handler of events["session_shutdown"] ?? []) {
+      await handler({ reason: "fork", targetSessionFile: targetFile }, ctx);
+    }
+    await expect(fs.access(checkpointSdk.getRepoDir(sessionFile))).rejects.toThrow();
+    await expect(fs.access(checkpointSdk.getRepoDir(targetFile))).rejects.toThrow();
+  });
+
+  test("a cached producer stops checkpointing when its working folder ceases to be a Git work tree", async () => {
+    const { api, events, appendEntry } = createMockApi();
+    const ext = await import("./index");
+    ext.default(api);
+    const ctx = createMockContext(sessionFile, [createUserEntry("entry-1", "hello")], tmpDir);
+    for (const handler of events["session_start"] ?? []) await handler({ reason: "new" }, ctx);
+    await emitAssistantStart(events, ctx);
+    await fs.writeFile(path.join(tmpDir, "unrelated.txt"), "must not checkpoint\n");
+    vi.mocked(checkpointSdk.isGitWorkTree).mockResolvedValue(false);
+    const stage = vi.spyOn(RepoManager.prototype, "stageAll");
+    await emitAssistantStart(events, ctx);
+    await emitAssistantEnd(events, ctx);
+    for (const handler of events["agent_end"] ?? []) await handler({}, ctx);
+    expect(stage).not.toHaveBeenCalled();
+    expect(appendEntry).not.toHaveBeenCalled();
+  });
+
+  test("non-Git resume and tree file restore warn without treating storage as corrupt", async () => {
+    vi.mocked(checkpointSdk.isGitWorkTree).mockResolvedValue(false);
+    await fs.writeFile(
+      path.join(tmpDir, ".pi", "settings.json"),
+      JSON.stringify({
+        ayu: { checkpoint: { restoreOnResume: true }, rewind: { restoreOnTree: "always" } },
+      }),
+    );
+    const legacyRepo = new RepoManager(
+      checkpointSdk.getGitDir(checkpointSdk.getRepoDir(sessionFile)),
+      checkpointSdk.getIndexPath(checkpointSdk.getRepoDir(sessionFile)),
+      tmpDir,
+    );
+    await legacyRepo.init();
+    const refresh = vi.spyOn(RepoManager.prototype, "lockedSetExclude");
+    const checkout = vi.spyOn(RepoManager.prototype, "safeCheckout");
+    const cp = createCheckpointEntry({ fileCount: 1 });
+    const branch = [
+      createUserEntry("entry-1", "hello"),
+      { type: "custom", customType: "pi-checkpoint", data: cp },
+    ];
+    const { api, events } = createMockApi();
+    const ext = await import("./index");
+    ext.default(api);
+    const ctx = createMockContext(sessionFile, branch, tmpDir);
+    for (const handler of events["session_start"] ?? []) await handler({ reason: "resume" }, ctx);
+    expectCodeRestoreWarningWidget(
+      ctx.ui.setWidget,
+      "File checkpoints require an existing Git work tree. Conversation restore is still available.",
+    );
+    ctx.ui.setWidget.mockClear();
+    for (const handler of events["session_tree"] ?? []) {
+      await handler({ oldLeafId: "old", newLeafId: "entry-1" }, ctx);
+    }
+    // Tree navigation itself remains available; any requested file restore is guarded.
+    expect(refresh).not.toHaveBeenCalled();
+    expect(checkout).not.toHaveBeenCalled();
+    expect(ctx.ui.notify).not.toHaveBeenCalled();
+  });
+
+  test("storage setup failures warn once, let the agent continue, and retry after reload", async () => {
+    const init = vi
+      .spyOn(RepoManager.prototype, "init")
+      .mockRejectedValueOnce(new Error("ENOSPC: no space left on device"));
+    const { api, events, appendEntry } = createMockApi();
+    const ext = await import("./index");
+    ext.default(api);
+    const ctx = createMockContext(sessionFile, [createUserEntry("entry-1", "hello")], tmpDir);
+    for (const handler of events["session_start"] ?? []) await handler({ reason: "new" }, ctx);
+    await expect(emitAssistantStart(events, ctx)).resolves.toBeUndefined();
+    await emitAssistantStart(events, ctx);
+    expect(init).toHaveBeenCalledTimes(1);
+    expect(appendEntry).not.toHaveBeenCalled();
+    expect(ctx.ui.notify).toHaveBeenCalledExactlyOnceWith(
+      "File checkpoint could not be created: ENOSPC: no space left on device. Automatic file checkpoints are paused for this session; the agent can continue. Resolve the storage problem, then run /reload to retry.",
+      "warning",
+    );
+    for (const handler of events["session_start"] ?? []) await handler({ reason: "reload" }, ctx);
+    await emitAssistantStart(events, ctx);
+    expect(init).toHaveBeenCalledTimes(2);
   });
 
   test("session_start skips manifest sync when no session file is available", async () => {
@@ -3566,6 +3720,7 @@ describe("checkpoint extension", () => {
       expect(safeCheckout).toHaveBeenCalled();
       expect(targetCtx.ui.notify).not.toHaveBeenCalled();
       vi.restoreAllMocks();
+      vi.spyOn(checkpointSdk, "isGitWorkTree").mockResolvedValue(true);
     }
   }, 30000);
 
@@ -3632,6 +3787,7 @@ describe("checkpoint extension", () => {
         expect.any(String),
       );
       vi.restoreAllMocks();
+      vi.spyOn(checkpointSdk, "isGitWorkTree").mockResolvedValue(true);
     }
   }, 15000);
 
@@ -3687,6 +3843,7 @@ describe("checkpoint extension", () => {
         expect.any(String),
       );
       vi.restoreAllMocks();
+      vi.spyOn(checkpointSdk, "isGitWorkTree").mockResolvedValue(true);
     }
   }, 15000);
 

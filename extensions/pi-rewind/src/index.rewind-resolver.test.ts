@@ -104,6 +104,8 @@ describe("rewind resolver", () => {
     vi.stubEnv("HOME", tmpDir);
     vi.stubEnv("USERPROFILE", tmpDir);
     vi.resetModules();
+    const reloadedSdk = await import("@ayulab/pi-checkpoint");
+    vi.spyOn(reloadedSdk, "isGitWorkTree").mockResolvedValue(true);
   });
 
   afterEach(async () => {
@@ -181,6 +183,18 @@ describe("rewind resolver", () => {
       message: "Checkpoint storage could not be prepared for rewind: boom",
       level: "error",
     });
+
+    const reloadedSdk = await import("@ayulab/pi-checkpoint");
+    vi.mocked(reloadedSdk.isGitWorkTree).mockResolvedValue(false);
+    const refresh = vi.spyOn(success.repo, "lockedSetExclude");
+    const previousRefreshes = refresh.mock.calls.length;
+    await expect(registration.getRepo("test-session")).resolves.toEqual({
+      ok: false,
+      message:
+        "File checkpoints require an existing Git work tree. Conversation restore is still available.",
+      level: "warning",
+    });
+    expect(refresh).toHaveBeenCalledTimes(previousRefreshes);
   }, 15000);
 
   test("session_tree skips checkout when rewind marks the target code commit as synced", async () => {
