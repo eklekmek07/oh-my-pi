@@ -37,7 +37,11 @@ export interface TreeRestoreIntent {
 export type RestoreRepoResult =
   | { readonly ok: true; readonly repo: RepoManager }
   | { readonly ok: false; readonly reason: "not-found" }
-  | { readonly ok: false; readonly reason: "unusable"; readonly message: string };
+  | {
+      readonly ok: false;
+      readonly reason: "unusable" | "not-git-work-tree";
+      readonly message: string;
+    };
 
 export const CODE_RESTORE_WARNING_WIDGET_ID = "pi-rewind-code-restore-warning";
 export const CHECKPOINT_SESSION_STORAGE_MISSING_MESSAGE =

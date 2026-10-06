@@ -187,9 +187,13 @@ flowchart TD
 
 In `restoreOnTree: "always"`, the file sync is a force restore: checkpoint-managed files are reset to the target checkpoint state, and untracked checkpoint-managed files are removed. Excluded paths and nested repository boundaries remain untouched.
 
-## Nested repositories
+## Checkpoint scope
 
-Phase 1 keeps the existing nested Git safety boundary. If you start Pi from a broad workspace that contains nested Git repositories, the outer checkpoint excludes those nested repositories. `/rewind` and `/tree` still protect non-excluded files in the outer work tree, but they do not restore files inside those nested repositories from the outer session. To protect a nested repository, start Pi in that repository root.
+Automatic file checkpoints require Pi's working directory to belong to an existing Git work tree. Repository subdirectories and linked worktrees qualify. Starting Pi in a non-Git folder, including a home directory containing nested repositories, skips file checkpoint creation and file restore. Native conversation navigation remains available. Existing checkpoint storage is preserved.
+
+Inside a Git work tree, nested repositories are excluded from the outer checkpoint. `/rewind` and `/tree` do not restore files inside those nested repositories from the outer session. To protect a nested repository, start Pi in that repository root.
+
+If automatic checkpoint storage setup fails, for example because the disk is full or the directory is not writable, Pi shows a warning and pauses automatic file checkpoints for that session. The agent can continue working without a file checkpoint. Resolve the storage problem and run `/reload` to retry.
 
 ## Session deletion
 
