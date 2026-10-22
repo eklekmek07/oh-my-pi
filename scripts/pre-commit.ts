@@ -1,8 +1,18 @@
 #!/usr/bin/env oxnode
 import { execFileSync } from "node:child_process";
 
+// Git exports repository selectors to hooks; nested test repos must not inherit them.
+const checkEnv = { ...process.env };
+const gitLocalEnv = execFileSync("git", ["rev-parse", "--local-env-vars"], { encoding: "utf8" });
+for (const name of gitLocalEnv.trim().split(/\s+/)) {
+  delete checkEnv[name];
+}
+
 function run(command: string, args: readonly string[]): void {
-  execFileSync(command, [...args], { stdio: "inherit" });
+  execFileSync(command, [...args], {
+    stdio: "inherit",
+    ...(command === "git" ? {} : { env: checkEnv }),
+  });
 }
 
 function stagedFiles(): string[] {
