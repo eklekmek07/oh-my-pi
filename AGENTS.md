@@ -10,6 +10,8 @@
 
 ## Read When Relevant
 
+- Before implementation or running checks, read [development workflow](docs/agent-development.md) for commands, coding rules and evidence requirements.
+
 - Always use this file as the repository entry point.
 - Do not eagerly read every referenced document; load the smallest relevant document set for the task, then follow links only when needed.
 - Read `README.md` when you need user-facing package behavior, install, or usage context.
@@ -20,29 +22,12 @@
 - When changing Pi extension, package, theme, skill, prompt, SDK, or TUI behavior, read the matching Pi docs first.
 - When a task matches an available skill, read and follow its `SKILL.md`; do not skip applicable workflows, checklists, or stop conditions.
 
-## Commands
-
-- Install: `mise install && pnpm install`
-- Local check: `pnpm run check`
-- CI gate: `pnpm run verify`
-- Build: `pnpm run build`
-- Release dry run: `pnpm run release:dry`
-
 ## Change Scope
 
 - One behavior change per task; prefer small vertical slices.
 - Do not do unrelated refactors, formatting churn, dependency bumps, or lockfile changes.
 - Do not edit `package.json`, `pnpm-lock.yaml`, release scripts, `.npmrc`, GitHub Actions, or `dist/` unless the task requires it.
 - User-facing changes to published packages or packaged resources need a changeset; docs-only and infrastructure-only changes follow `CONTRIBUTING.md`.
-
-## Coding Rules
-
-- Follow `CONTRIBUTING.md` for detailed code standards.
-- TypeScript ESM. Prefer `unknown` over `any`. Avoid `any`, non-null `!`, and unsafe `as` in production code; prefer type guards and keep unavoidable assertions local to typed boundaries.
-- In Pi extension runtime code, avoid `console.*`; use `ctx.ui.notify` for user-visible messages. CLI scripts and repo tooling may use `console.*` for terminal output.
-- Use `node:path` and `path.relative` for paths; do not hard-code `/` separators.
-- Extract shared runtime helpers to `internal/runtime-core`; promote stable public APIs to `sdk/`; keep domain-specific logic in the owning package until there is a second real consumer.
-- For bug fixes, reproduce first when practical and add or adjust tests before the fix.
 
 ## Risk Policy
 
@@ -72,9 +57,3 @@ When making behavioral changes to `AGENTS.md`, skills, prompts, or other agent i
 - Record the failure fact, change hypothesis, target behavior, and rollback condition before editing.
 - Prefer small bounded edits; do not add permanent rules from a single anecdote.
 - Prefer tests, lint, schema, CI, hooks, or benchmark cases over natural-language rules when practical.
-
-## Verification
-
-- Prefer evidence over self-assessment: run `pnpm run check` or the relevant test suite before claiming completion.
-- For bug fixes, reproduce the issue before fixing when practical; otherwise explain why reproduction was not possible.
-- Report exact files changed, commands run and exact outcomes, tests or checks not run with reason, and any residual risk.
